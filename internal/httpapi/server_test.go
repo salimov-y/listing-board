@@ -85,6 +85,31 @@ func TestStartRequiresASession(t *testing.T) {
 	}
 }
 
+func TestOtherUsersSheetsAreNotFound(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	routes := []struct{ method, path, cookie string }{
+		{http.MethodGet, "/api/jobs/" + job.ID, grace},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/file", grace},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/start", grace},
+		{http.MethodGet, "/api/jobs/" + job.ID + "/file", grace},
+		{http.MethodGet, "/api/jobs/" + board.NewID(), ada},
+	}
+	for _, route := range routes {
+		res := call(srv, route.method, route.path, route.cookie, nil, "")
+		if res.Code != http.StatusNotFound {
+			t.Errorf("%s %s: status %d, want 404", route.method, route.path, res.Code)
+		}
+	}
+	if got := getSheet(t, srv, ada, job.ID); got.Status != "draft" {
+		t.Fatalf("status %s after another account tried to start it, want draft", got.Status)
+	}
+}
+
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -113,6 +138,15 @@ func createSheet(t *testing.T, srv *Server, cookie, title, address string) board
 	res := call(srv, http.MethodPost, "/api/jobs", cookie, body, "application/json")
 	if res.Code != http.StatusCreated {
 		t.Fatalf("create %d: %s", res.Code, res.Body.String())
+	}
+	return decodeJob(t, res)
+}
+
+func getSheet(t *testing.T, srv *Server, cookie, id string) board.Job {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/jobs/"+id, cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("get %d: %s", res.Code, res.Body.String())
 	}
 	return decodeJob(t, res)
 }
