@@ -1,0 +1,7 @@
+# Notes
+
+One suggestion I rejected: for the rule that an account can have only one running sheet, Claude first proposed loading the account's sheets in the start handler and returning 409 when another one was running. I didn't take it, because two Start requests for different drafts that arrive together can both pass that check. Instead a partial unique index on `jobs (user_id) WHERE status = 'running'` lets Postgres enforce the rule, and the handler turns the unique violation into 409, the same way register already handles a duplicate email.
+
+How I checked the result: `go vet ./...`, `go test ./...` (the new upload and access tests fail against the original handlers) and `npm run build`. Then `docker compose up --build` and a curl pass over the README rules: PDF, text, empty, binary, 1 MiB + 1 byte and 20 MB uploads with nothing left in the volume, a `../../escaped.txt` filename, a second upload, start without a brochure, a repeated start returning the same `runId`, 409 for a second running sheet, 404 for another account on every id route, steps saved two seconds apart, `docker compose kill worker` mid-run and a restart that finished from the first pending step with the same `runId`, and a deleted `body` ending in `Brochure is missing`. In the browser the open sheet moved through the checklist and showed that error without a reload.
+
+The two tests the README calls wrong are rewritten under names that match the spec: `TestStartLeavesTheStepsToTheWorker` and `TestUploadStoresTheBrochureAsBody`.
