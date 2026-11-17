@@ -180,27 +180,35 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
   const [address, setAddress] = useState("");
   const [file, setFile] = useState<File | null>(null);
 
-  async function submit(event: FormEvent) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
     if (!file) {
       onError("Choose a brochure file");
       return;
     }
+    let job: Job;
     try {
-      const job = await api<Job>("/api/jobs", {
+      job = await api<Job>("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title, address }),
       });
-      const body = new FormData();
-      body.append("file", file);
-      const saved = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
-      setTitle("");
-      setAddress("");
-      setFile(null);
-      onCreated(saved);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Could not create the sheet");
+      return;
+    }
+    form.reset();
+    setTitle("");
+    setAddress("");
+    setFile(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      onCreated(await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body }));
+    } catch (err) {
+      onCreated(job);
+      onError(err instanceof Error ? err.message : "Could not attach the brochure");
     }
   }
 
