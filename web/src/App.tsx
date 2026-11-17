@@ -49,6 +49,24 @@ export function App() {
       .catch((err: Error) => setError(err.message));
   }, [me]);
 
+  useEffect(() => {
+    if (selected?.status !== "running") {
+      return;
+    }
+    const id = selected.id;
+    const timer = setInterval(() => {
+      api<Job>("/api/jobs/" + id)
+        .then(showJob)
+        .catch((err: Error) => setError(err.message));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [selected?.id, selected?.status]);
+
+  function showJob(job: Job) {
+    setSelected((current) => (current?.id === job.id ? job : current));
+    setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
+  }
+
   if (!ready) {
     return <p className="muted">Loading…</p>;
   }
@@ -102,10 +120,7 @@ export function App() {
         {selected ? (
           <Sheet
             job={selected}
-            onChange={(job) => {
-              setSelected(job);
-              setJobs((current) => current.map((item) => (item.id === job.id ? job : item)));
-            }}
+            onChange={showJob}
             onError={setError}
           />
         ) : (
