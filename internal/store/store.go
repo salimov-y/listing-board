@@ -37,6 +37,18 @@ func Open(dsn string) (*Store, error) {
 	return s, nil
 }
 
+// Wait retries Open until the database answers or the timeout passes.
+func Wait(dsn string, timeout time.Duration) (*Store, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		st, err := Open(dsn)
+		if err == nil || time.Now().After(deadline) {
+			return st, err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
@@ -95,7 +107,15 @@ func (s *Store) UserByToken(ctx context.Context, token string) (board.User, erro
 }
 
 func (s *Store) ListJobs(ctx context.Context, userID string) ([]board.Job, error) {
-	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+	return s.queryJobs(ctx, ` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+}
+
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	return s.queryJobs(ctx, ` WHERE status = 'running' ORDER BY updated_at`)
+}
+
+func (s *Store) queryJobs(ctx context.Context, where string, args ...any) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobSelect+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +163,9 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 		SET status = $1, error = $2, run_id = $3, filename = $4, checklist = $5, updated_at = $6
 		WHERE id = $7
 	`, job.Status, job.Error, job.RunID, job.Filename, string(raw), job.UpdatedAt.UTC(), job.ID)
+	if isUnique(err) {
+		return board.ErrDuplicate
+	}
 	if err != nil {
 		return err
 	}

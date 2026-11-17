@@ -20,7 +20,7 @@ import (
 	"listingboard/internal/board"
 )
 
-func TestStartMarksTheJobSuccessful(t *testing.T) {
+func TestStartLeavesTheStepsToTheWorker(t *testing.T) {
 	srv, _ := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
@@ -31,16 +31,83 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	got := decodeJob(t, res)
-	if got.Status != "success" {
-		t.Fatalf("status %s, want success", got.Status)
+	if got.Status != "running" {
+		t.Fatalf("status %s, want running", got.Status)
 	}
 	if got.RunID == "" {
 		t.Fatal("runId is empty")
 	}
-	for _, step := range got.Checklist {
-		if step.State != "done" {
-			t.Fatalf("step %q is %s", step.Label, step.State)
+	for i, step := range got.Checklist {
+		if step.Label != board.NewChecklist()[i].Label || step.State != "pending" {
+			t.Fatalf("step %d is %q %s, want %q pending", i, step.Label, step.State, board.NewChecklist()[i].Label)
 		}
+	}
+
+	again := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if again.Code != http.StatusOK {
+		t.Fatalf("second start %d: %s", again.Code, again.Body.String())
+	}
+	if second := decodeJob(t, again); second.RunID != got.RunID || second.Status != "running" {
+		t.Fatalf("second start gave %s with runId %q, want running with %q", second.Status, second.RunID, got.RunID)
+	}
+}
+
+func TestStartNeedsABrochure(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusBadRequest || errorOf(t, res) != "Attach a brochure first" {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestStartConflictsWithAnotherRunningSheet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	first := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	second := createSheet(t, srv, cookie, "Harbour flat", "2 Quay Road")
+	uploadFile(t, srv, cookie, first.ID, "first.txt", []byte("first"), "text/plain")
+	uploadFile(t, srv, cookie, second.ID, "second.txt", []byte("second"), "text/plain")
+	call(srv, http.MethodPost, "/api/jobs/"+first.ID+"/start", cookie, nil, "")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+second.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusConflict || errorOf(t, res) == "" {
+		t.Fatalf("status %d: %s, want 409", res.Code, res.Body.String())
+	}
+	if got := getSheet(t, srv, cookie, second.ID); got.Status != "draft" {
+		t.Fatalf("status %s, want draft", got.Status)
+	}
+
+	other := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, other, "Mill house", "5 Mill Lane")
+	uploadFile(t, srv, other, job.ID, "mill.txt", []byte("mill"), "text/plain")
+	if res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", other, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("another account's start %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestStartKeepsAFailedSheetFailed(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	sheet := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, sheet.ID, "brochure.txt", []byte("hello"), "text/plain")
+	job, err := srv.store.Job(context.Background(), sheet.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.Status = "failed"
+	job.RunID = board.NewID()
+	job.Error = "Brochure is missing"
+	if err := srv.store.UpdateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	got := decodeJob(t, res)
+	if res.Code != http.StatusOK || got.Status != "failed" || got.RunID != job.RunID || got.Error != job.Error {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 }
 
@@ -288,6 +355,17 @@ func storedFiles(t *testing.T, dir string) []string {
 	return files
 }
 
+func errorOf(t *testing.T, res *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("error body is not JSON: %s", res.Body.String())
+	}
+	return body.Error
+}
+
 func decodeJob(t *testing.T, res *httptest.ResponseRecorder) board.Job {
 	t.Helper()
 	var job board.Job
@@ -419,6 +497,11 @@ func (m *mem) UpdateJob(_ context.Context, job board.Job) error {
 	defer m.mu.Unlock()
 	if _, ok := m.jobs[job.ID]; !ok {
 		return board.ErrNotFound
+	}
+	for _, other := range m.jobs {
+		if job.Status == "running" && other.Status == "running" && other.UserID == job.UserID && other.ID != job.ID {
+			return board.ErrDuplicate
+		}
 	}
 	m.jobs[job.ID] = cloneJob(job)
 	return nil
