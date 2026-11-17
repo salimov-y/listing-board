@@ -1,10 +1,13 @@
 package worker
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"listingboard/internal/board"
 )
@@ -57,6 +60,77 @@ func TestAdvanceFailsWhenTheBrochureIsMissing(t *testing.T) {
 	if next.Status != "failed" || next.Error != "Brochure is missing" || doneSteps(next) != 0 {
 		t.Fatalf("status %s, error %q, %d steps done", next.Status, next.Error, doneSteps(next))
 	}
+}
+
+func TestRunSavesOneStepPerPause(t *testing.T) {
+	dir := t.TempDir()
+	st := &fakeStore{job: runningSheet(t, dir)}
+	pause := 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	began := time.Now()
+	go func() {
+		Run(ctx, st, dir, pause)
+		close(stopped)
+	}()
+	for deadline := time.Now().Add(2 * time.Second); len(st.saved()) < 3 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(3 * pause)
+	cancel()
+	<-stopped
+
+	saves := st.saved()
+	if len(saves) != 3 {
+		t.Fatalf("%d saves, want one per step", len(saves))
+	}
+	last := began
+	for i, save := range saves {
+		if done := doneSteps(save.job); done != i+1 {
+			t.Fatalf("save %d has %d steps done, want %d", i, done, i+1)
+		}
+		if gap := save.at.Sub(last); gap < pause {
+			t.Fatalf("save %d came %s after the previous one, want at least %s", i, gap, pause)
+		}
+		last = save.at
+	}
+	if saves[2].job.Status != "success" {
+		t.Fatalf("status %s after the last step, want success", saves[2].job.Status)
+	}
+}
+
+type fakeStore struct {
+	mu    sync.Mutex
+	job   board.Job
+	saves []save
+}
+
+type save struct {
+	at  time.Time
+	job board.Job
+}
+
+func (f *fakeStore) RunningJobs(context.Context) ([]board.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.job.Status != "running" {
+		return nil, nil
+	}
+	return []board.Job{f.job}, nil
+}
+
+func (f *fakeStore) UpdateJob(_ context.Context, job board.Job) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.job = job
+	f.saves = append(f.saves, save{at: time.Now(), job: job})
+	return nil
+}
+
+func (f *fakeStore) saved() []save {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.saves)
 }
 
 func runningSheet(t *testing.T, dir string) board.Job {
