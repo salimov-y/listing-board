@@ -65,13 +65,22 @@ const icons = {
   play: <path d="M7 4.5v15l13-7.5z" fill="currentColor" />,
 };
 
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { credentials: "include", ...init });
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
     const message = data && typeof data.error === "string" ? data.error : res.statusText;
-    throw new Error(message);
+    throw new ApiError(message, res.status);
   }
   return data as T;
 }
@@ -113,18 +122,38 @@ export function App() {
       .catch((err: Error) => setError(err.message));
   }, [me]);
 
+  const runningId = jobs.find((job) => job.status === "running")?.id;
+
   useEffect(() => {
-    if (selected?.status !== "running") {
+    if (!runningId) {
       return;
     }
-    const id = selected.id;
-    const timer = setInterval(() => {
-      api<Job>("/api/jobs/" + id)
-        .then(showJob)
-        .catch((err: Error) => setError(err.message));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [selected?.id, selected?.status]);
+    let stopped = false;
+    let timer = 0;
+    const poll = () => {
+      api<Job>("/api/jobs/" + runningId)
+        .then((job) => {
+          if (!stopped) {
+            showJob(job);
+          }
+        })
+        .catch((err: unknown) => {
+          if (err instanceof ApiError && err.status === 401) {
+            setMe(null);
+          }
+        })
+        .finally(() => {
+          if (!stopped) {
+            timer = window.setTimeout(poll, 1000);
+          }
+        });
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [runningId]);
 
   function showJob(job: Job) {
     setSelected((current) => (current?.id === job.id ? job : current));
@@ -183,7 +212,11 @@ export function App() {
               {jobs.length === 0 ? <li className="muted">No sheets yet.</li> : null}
               {jobs.map((job) => (
                 <li key={job.id}>
-                  <button className={selected?.id === job.id ? "row on" : "row"} onClick={() => setSelected(job)}>
+                  <button
+                    className={selected?.id === job.id ? "row on" : "row"}
+                    aria-current={selected?.id === job.id ? "true" : undefined}
+                    onClick={() => setSelected(job)}
+                  >
                     <span className="row-top">
                       <span className="row-text">
                         <strong>{job.title}</strong>
@@ -374,12 +407,7 @@ function Create({ onCreated, onError }: { onCreated: (job: Job) => void; onError
       <label>
         Brochure
         <span className="drop">
-          <input
-            type="file"
-            accept=".pdf,.txt,application/pdf,text/plain"
-            onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-            required
-          />
+          <input type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} required />
           <span className="muted small">PDF or plain text, up to 1 MiB</span>
         </span>
       </label>
@@ -485,7 +513,7 @@ function Sheet({
       ) : job.status === "draft" ? (
         <label className="drop">
           Attach a brochure
-          <input type="file" accept=".pdf,.txt,application/pdf,text/plain" onChange={attach} />
+          <input type="file" onChange={attach} />
           <span className="muted small">PDF or plain text, up to 1 MiB</span>
         </label>
       ) : null}
