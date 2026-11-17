@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -225,12 +226,13 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	defer drain(r.Body)
 	if job.Filename != "" {
 		writeErr(w, http.StatusBadRequest, "This sheet already has a brochure")
 		return
 	}
-	part, err := filePart(r)
-	if err != nil || part.FileName() == "" {
+	part, name, err := filePart(r)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
 		return
 	}
@@ -248,21 +250,25 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := board.BrochurePath(s.dataDir, job)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	tmp, err := writeTemp(filepath.Dir(path), data)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	defer os.Remove(tmp)
+	attached, err := s.store.AttachBrochure(r.Context(), job.ID, name)
+	if errors.Is(err, board.ErrDuplicate) {
+		writeErr(w, http.StatusBadRequest, "This sheet already has a brochure")
+		return
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	job.Filename = part.FileName()
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
-	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, attached)
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
@@ -313,7 +319,8 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", brochureType(data))
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(job.Filename)}))
 	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, bytes.NewReader(data))
 }
 
@@ -363,20 +370,55 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filePart(r *http.Request) (*multipart.Part, error) {
+func filePart(r *http.Request) (*multipart.Part, string, error) {
 	reader, err := r.MultipartReader()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	for {
 		part, err := reader.NextPart()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		if part.FormName() == "file" {
-			return part, nil
+		if name := filenameFromHeader(part); part.FormName() == "file" && name != "" {
+			return part, name, nil
 		}
 	}
+}
+
+func filenameFromHeader(part *multipart.Part) string {
+	_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+	if err == nil {
+		if name := strings.TrimSpace(params["filename"]); name != "" {
+			return name
+		}
+	}
+	return part.FileName()
+}
+
+// drain reads what is left of a rejected upload, so a client that sends the
+// whole body before reading the response still gets the response.
+func drain(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 32<<20))
+}
+
+func writeTemp(dir string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(dir, "upload-*")
+	if err != nil {
+		return "", err
+	}
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
 }
 
 func brochureType(data []byte) string {
@@ -402,11 +444,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeErr(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func strconvQuote(value string) string {
-	b, _ := json.Marshal(value)
-	return string(b)
 }
 
 func withCORS(next http.Handler) http.Handler {

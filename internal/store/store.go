@@ -192,6 +192,19 @@ func (s *Store) StartJob(ctx context.Context, id, runID string) (board.Job, erro
 	return job, err
 }
 
+// AttachBrochure sets the filename of a draft that has none yet. Any other sheet is ErrDuplicate.
+func (s *Store) AttachBrochure(ctx context.Context, id, filename string) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs SET filename = $1, updated_at = $2
+		WHERE id = $3 AND status = 'draft' AND filename = ''
+		RETURNING `+jobColumns, filename, time.Now().UTC(), id)
+	job, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return board.Job{}, board.ErrDuplicate
+	}
+	return job, err
+}
+
 const jobColumns = `id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at`
 
 const jobSelect = `

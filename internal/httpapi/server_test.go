@@ -18,10 +18,11 @@ import (
 	"time"
 
 	"listingboard/internal/board"
+	"listingboard/internal/worker"
 )
 
-func TestStartLeavesTheStepsToTheWorker(t *testing.T) {
-	srv, _ := newTestServer(t)
+func TestStartMarksTheJobSuccessful(t *testing.T) {
+	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
 	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
@@ -30,25 +31,37 @@ func TestStartLeavesTheStepsToTheWorker(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-	got := decodeJob(t, res)
-	if got.Status != "running" {
-		t.Fatalf("status %s, want running", got.Status)
+	started := decodeJob(t, res)
+	if started.Status != "running" || started.RunID == "" {
+		t.Fatalf("start gave %s with runId %q, want running with a new runId", started.Status, started.RunID)
 	}
-	if got.RunID == "" {
-		t.Fatal("runId is empty")
-	}
-	for i, step := range got.Checklist {
+	for i, step := range started.Checklist {
 		if step.Label != board.NewChecklist()[i].Label || step.State != "pending" {
-			t.Fatalf("step %d is %q %s, want %q pending", i, step.Label, step.State, board.NewChecklist()[i].Label)
+			t.Fatalf("start left step %d as %q %s, want %q pending for the worker", i, step.Label, step.State, board.NewChecklist()[i].Label)
 		}
 	}
-
 	again := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
-	if again.Code != http.StatusOK {
-		t.Fatalf("second start %d: %s", again.Code, again.Body.String())
+	if again.Code != http.StatusOK || decodeJob(t, again).RunID != started.RunID {
+		t.Fatalf("second start %d: %s, want runId %q", again.Code, again.Body.String(), started.RunID)
 	}
-	if second := decodeJob(t, again); second.RunID != got.RunID || second.Status != "running" {
-		t.Fatalf("second start gave %s with runId %q, want running with %q", second.Status, second.RunID, got.RunID)
+
+	for range started.Checklist {
+		stored, err := srv.store.Job(context.Background(), job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := srv.store.UpdateJob(context.Background(), worker.Advance(stored, dir)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := getSheet(t, srv, cookie, job.ID)
+	if got.Status != "success" || got.RunID != started.RunID || got.Error != "" {
+		t.Fatalf("after the worker: %s, runId %q, error %q; want success with runId %q", got.Status, got.RunID, got.Error, started.RunID)
+	}
+	for _, step := range got.Checklist {
+		if step.State != "done" {
+			t.Fatalf("after the worker step %q is %s", step.Label, step.State)
+		}
 	}
 }
 
@@ -139,43 +152,24 @@ func TestStartKeepsAFailedSheetFailed(t *testing.T) {
 	}
 }
 
-func TestUploadStoresTheBrochureAsBody(t *testing.T) {
-	srv, dir := newTestServer(t)
-	cookie := signUp(t, srv, "ada@example.com")
-	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
-	saved := uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
-
-	if saved.Filename != "brochure.pdf" {
-		t.Fatalf("filename %q, want brochure.pdf", saved.Filename)
-	}
-	path := filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("brochure was not stored at %s: %v", path, err)
-	}
-	if string(data) != "%PDF-1.4\n" {
-		t.Fatalf("stored %q", data)
-	}
-	if files := storedFiles(t, dir); len(files) != 1 {
-		t.Fatalf("stored %v, want only %s", files, path)
-	}
-}
-
-func TestUploadIgnoresDirectoriesInTheFilename(t *testing.T) {
+func TestUploadKeepsTheClientFilename(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
 	saved := uploadFile(t, srv, cookie, job.ID, "../../escaped.txt", []byte("hello"), "text/plain")
 
-	if saved.Filename != "escaped.txt" {
-		t.Fatalf("filename %q, want escaped.txt", saved.Filename)
+	if saved.Filename != "../../escaped.txt" {
+		t.Fatalf("filename %q, want the client's ../../escaped.txt", saved.Filename)
+	}
+	body := filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body")
+	if data, err := os.ReadFile(body); err != nil || string(data) != "hello" {
+		t.Fatalf("brochure at %s: %q, %v", body, data, err)
+	}
+	if files := storedFiles(t, dir); len(files) != 1 || files[0] != body {
+		t.Fatalf("stored %v, want only %s", files, body)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "..", "escaped.txt")); !os.IsNotExist(err) {
 		t.Fatal("the upload wrote outside the data directory")
-	}
-	want := filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body")
-	if files := storedFiles(t, dir); len(files) != 1 || files[0] != want {
-		t.Fatalf("stored %v, want only %s", files, want)
 	}
 }
 
@@ -184,20 +178,20 @@ func TestUploadDecidesTheTypeFromTheBytes(t *testing.T) {
 	cookie := signUp(t, srv, "ada@example.com")
 	user := accountID(t, srv, cookie)
 	cases := []struct {
-		name string
-		data []byte
-		want int
+		name, filename, contentType string
+		data                        []byte
+		want                        int
 	}{
-		{"pdf", []byte("%PDF-1.7\n\x00\xff"), http.StatusOK},
-		{"text", []byte("Two bedrooms, café downstairs.\n"), http.StatusOK},
-		{"empty", nil, http.StatusBadRequest},
-		{"binary", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, http.StatusBadRequest},
-		{"nul byte", []byte("hello\x00world"), http.StatusBadRequest},
-		{"invalid utf-8", []byte("caf\xe9"), http.StatusBadRequest},
+		{"pdf sent as a png", "photo.png", "image/png", []byte("%PDF-1.7\n\x00\xff"), http.StatusOK},
+		{"text sent as a png", "photo.png", "image/png", []byte("Two bedrooms, café downstairs.\n"), http.StatusOK},
+		{"empty file sent as a pdf", "brochure.pdf", "application/pdf", nil, http.StatusBadRequest},
+		{"png sent as a pdf", "brochure.pdf", "application/pdf", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, http.StatusBadRequest},
+		{"nul byte sent as text", "notes.txt", "text/plain", []byte("hello\x00world"), http.StatusBadRequest},
+		{"invalid utf-8 sent as text", "notes.txt", "text/plain", []byte("caf\xe9"), http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		job := createSheet(t, srv, cookie, c.name, "10 Market Street")
-		res := upload(srv, cookie, job.ID, "photo.png", c.data, "image/png")
+		res := upload(srv, cookie, job.ID, c.filename, c.data, c.contentType)
 		if res.Code != c.want {
 			t.Errorf("%s: status %d, want %d", c.name, res.Code, c.want)
 		}
@@ -239,6 +233,41 @@ func TestSecondUploadIsRejected(t *testing.T) {
 	}
 	if got := getSheet(t, srv, cookie, job.ID); got.Filename != "first.txt" {
 		t.Fatalf("filename %q, want first.txt", got.Filename)
+	}
+}
+
+func TestParallelUploadsKeepOneBrochure(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	responses := make([]*httptest.ResponseRecorder, 20)
+	var wg sync.WaitGroup
+	for i := range responses {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			name := fmt.Sprintf("brochure-%d.txt", i)
+			responses[i] = upload(srv, cookie, job.ID, name, []byte(name), "text/plain")
+		}()
+	}
+	wg.Wait()
+
+	accepted := 0
+	for _, res := range responses {
+		if res.Code == http.StatusOK {
+			accepted++
+		} else if res.Code != http.StatusBadRequest {
+			t.Fatalf("status %d: %s", res.Code, res.Body.String())
+		}
+	}
+	got := getSheet(t, srv, cookie, job.ID)
+	data, err := os.ReadFile(filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body"))
+	if accepted != 1 || err != nil || string(data) != got.Filename {
+		t.Fatalf("%d uploads accepted; filename %q, body %q, %v", accepted, got.Filename, data, err)
+	}
+	if files := storedFiles(t, dir); len(files) != 1 {
+		t.Fatalf("stored %v, want only the body", files)
 	}
 }
 
@@ -528,6 +557,19 @@ func (m *mem) UpdateJob(_ context.Context, job board.Job) error {
 	}
 	m.jobs[job.ID] = cloneJob(job)
 	return nil
+}
+
+func (m *mem) AttachBrochure(_ context.Context, id, filename string) (board.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok || job.Status != "draft" || job.Filename != "" {
+		return board.Job{}, board.ErrDuplicate
+	}
+	job.Filename = filename
+	job.UpdatedAt = time.Now().UTC()
+	m.jobs[id] = job
+	return cloneJob(job), nil
 }
 
 func (m *mem) StartJob(_ context.Context, id, runID string) (board.Job, error) {

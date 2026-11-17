@@ -79,4 +79,5 @@ type Store interface {
 	Job(ctx context.Context, id string) (Job, error)
 	UpdateJob(ctx context.Context, job Job) error
 	StartJob(ctx context.Context, id, runID string) (Job, error)
+	AttachBrochure(ctx context.Context, id, filename string) (Job, error)
 }
