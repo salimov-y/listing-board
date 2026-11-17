@@ -1,23 +1,27 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
-	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"listingboard/internal/board"
 )
 
-const sessionCookie = "lb_session"
+const (
+	sessionCookie   = "lb_session"
+	maxBrochureSize = 1 << 20
+)
 
 type Server struct {
 	store   board.Store
@@ -221,41 +225,38 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+	if job.Filename != "" {
+		writeErr(w, http.StatusBadRequest, "This sheet already has a brochure")
 		return
 	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
+	part, err := filePart(r)
+	if err != nil || part.FileName() == "" {
 		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
 		return
 	}
-	defer file.Close()
-	name := filenameFromHeader(header)
-	if strings.TrimSpace(name) == "" || !headerAllows(name, header.Header.Get("Content-Type")) {
-		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
+	data, err := io.ReadAll(io.LimitReader(part, maxBrochureSize+1))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
 		return
 	}
-	if len(data) > 8<<20 {
-		writeErr(w, http.StatusBadRequest, "Brochure is too large")
+	if len(data) > maxBrochureSize {
+		writeErr(w, http.StatusBadRequest, "Brochure must be 1 MiB or smaller")
 		return
 	}
-	dir := filepath.Join(s.dataDir, job.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if brochureType(data) == "" {
+		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
+		return
+	}
+	path := board.BrochurePath(s.dataDir, job)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	dst := filepath.Join(dir, name)
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	job.Filename = name
+	job.Filename = part.FileName()
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpdateJob(r.Context(), job); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
@@ -304,14 +305,14 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(filepath.Join(s.dataDir, job.ID, job.Filename))
+	data, err := os.ReadFile(board.BrochurePath(s.dataDir, job))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	defer f.Close()
+	w.Header().Set("Content-Type", brochureType(data))
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
-	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
+	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, bytes.NewReader(data))
 }
 
 func (s *Server) load(w http.ResponseWriter, r *http.Request, user board.User) (board.Job, bool) {
@@ -360,23 +361,30 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filenameFromHeader(header *multipart.FileHeader) string {
-	_, params, err := mime.ParseMediaType(header.Header.Get("Content-Disposition"))
-	if err == nil {
-		if name := strings.TrimSpace(params["filename"]); name != "" {
-			return name
+func filePart(r *http.Request) (*multipart.Part, error) {
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			return nil, err
+		}
+		if part.FormName() == "file" {
+			return part, nil
 		}
 	}
-	return header.Filename
 }
 
-func headerAllows(name, contentType string) bool {
-	ct := strings.ToLower(contentType)
-	lower := strings.ToLower(name)
-	if strings.Contains(ct, "pdf") || strings.Contains(ct, "text/plain") {
-		return true
+func brochureType(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte("%PDF-")):
+		return "application/pdf"
+	case len(data) > 0 && utf8.Valid(data) && bytes.IndexByte(data, 0) < 0:
+		return "text/plain; charset=utf-8"
 	}
-	return strings.HasSuffix(lower, ".pdf") || strings.HasSuffix(lower, ".txt")
+	return ""
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {

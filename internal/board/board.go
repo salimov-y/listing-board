@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"time"
 )
 
@@ -44,6 +45,10 @@ func NewChecklist() []Step {
 		{Label: "Checking the address", State: "pending"},
 		{Label: "Publishing the sheet", State: "pending"},
 	}
+}
+
+func BrochurePath(dataDir string, job Job) string {
+	return filepath.Join(dataDir, job.UserID, job.ID, "body")
 }
 
 func NewID() string {

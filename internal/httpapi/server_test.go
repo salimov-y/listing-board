@@ -44,15 +44,106 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 	}
 }
 
-func TestUploadKeepsTheClientFilename(t *testing.T) {
+func TestUploadStoresTheBrochureAsBody(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
-	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	saved := uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
 
-	path := filepath.Join(dir, job.ID, "brochure.pdf")
-	if _, err := os.Stat(path); err != nil {
+	if saved.Filename != "brochure.pdf" {
+		t.Fatalf("filename %q, want brochure.pdf", saved.Filename)
+	}
+	path := filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body")
+	data, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatalf("brochure was not stored at %s: %v", path, err)
+	}
+	if string(data) != "%PDF-1.4\n" {
+		t.Fatalf("stored %q", data)
+	}
+	if files := storedFiles(t, dir); len(files) != 1 {
+		t.Fatalf("stored %v, want only %s", files, path)
+	}
+}
+
+func TestUploadIgnoresDirectoriesInTheFilename(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	saved := uploadFile(t, srv, cookie, job.ID, "../../escaped.txt", []byte("hello"), "text/plain")
+
+	if saved.Filename != "escaped.txt" {
+		t.Fatalf("filename %q, want escaped.txt", saved.Filename)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "..", "escaped.txt")); !os.IsNotExist(err) {
+		t.Fatal("the upload wrote outside the data directory")
+	}
+	want := filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body")
+	if files := storedFiles(t, dir); len(files) != 1 || files[0] != want {
+		t.Fatalf("stored %v, want only %s", files, want)
+	}
+}
+
+func TestUploadDecidesTheTypeFromTheBytes(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	user := accountID(t, srv, cookie)
+	cases := []struct {
+		name string
+		data []byte
+		want int
+	}{
+		{"pdf", []byte("%PDF-1.7\n\x00\xff"), http.StatusOK},
+		{"text", []byte("Two bedrooms, café downstairs.\n"), http.StatusOK},
+		{"empty", nil, http.StatusBadRequest},
+		{"binary", []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, http.StatusBadRequest},
+		{"nul byte", []byte("hello\x00world"), http.StatusBadRequest},
+		{"invalid utf-8", []byte("caf\xe9"), http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		job := createSheet(t, srv, cookie, c.name, "10 Market Street")
+		res := upload(srv, cookie, job.ID, "photo.png", c.data, "image/png")
+		if res.Code != c.want {
+			t.Errorf("%s: status %d, want %d", c.name, res.Code, c.want)
+		}
+		_, err := os.Stat(filepath.Join(dir, user, job.ID, "body"))
+		if c.want != http.StatusOK && !os.IsNotExist(err) {
+			t.Errorf("%s: rejected brochure was left on disk", c.name)
+		}
+	}
+}
+
+func TestUploadRejectsFilesOverOneMebibyte(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := upload(srv, cookie, job.ID, "big.txt", bytes.Repeat([]byte("a"), 1<<20+1), "text/plain")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.Code)
+	}
+	if files := storedFiles(t, dir); len(files) != 0 {
+		t.Fatalf("rejected brochure was left on disk: %v", files)
+	}
+	uploadFile(t, srv, cookie, job.ID, "exact.txt", bytes.Repeat([]byte("a"), 1<<20), "text/plain")
+}
+
+func TestSecondUploadIsRejected(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "first.txt", []byte("first"), "text/plain")
+
+	res := upload(srv, cookie, job.ID, "second.txt", []byte("second"), "text/plain")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.Code)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, accountID(t, srv, cookie), job.ID, "body"))
+	if err != nil || string(data) != "first" {
+		t.Fatalf("stored %q, %v; want the first brochure", data, err)
+	}
+	if got := getSheet(t, srv, cookie, job.ID); got.Filename != "first.txt" {
+		t.Fatalf("filename %q, want first.txt", got.Filename)
 	}
 }
 
@@ -151,27 +242,50 @@ func getSheet(t *testing.T, srv *Server, cookie, id string) board.Job {
 	return decodeJob(t, res)
 }
 
-func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) {
-	t.Helper()
+func upload(srv *Server, cookie, id, name string, data []byte, contentType string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	header := textproto.MIMEHeader{}
 	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, name))
 	header.Set("Content-Type", contentType)
-	part, err := writer.CreatePart(header)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := part.Write(data); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
+	part, _ := writer.CreatePart(header)
+	_, _ = part.Write(data)
+	_ = writer.Close()
+	return call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
+}
+
+func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) board.Job {
+	t.Helper()
+	res := upload(srv, cookie, id, name, data, contentType)
 	if res.Code != http.StatusOK {
 		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
 	}
+	return decodeJob(t, res)
+}
+
+func accountID(t *testing.T, srv *Server, cookie string) string {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
+	var me account
+	if err := json.Unmarshal(res.Body.Bytes(), &me); err != nil || me.ID == "" {
+		t.Fatalf("me %d: %s", res.Code, res.Body.String())
+	}
+	return me.ID
+}
+
+func storedFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			files = append(files, path)
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }
 
 func decodeJob(t *testing.T, res *httptest.ResponseRecorder) board.Job {
