@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useState } from "react";
 
 type Step = { label: string; state: string };
 
@@ -247,12 +247,35 @@ function Sheet({
     }
   }
 
+  async function attach(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+    onError("");
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const next = await api<Job>("/api/jobs/" + job.id + "/file", { method: "POST", body });
+      onChange(next);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Could not attach the brochure");
+    }
+  }
+
   return (
     <article className="sheet">
       <h2>{job.title}</h2>
       <p>{job.address}</p>
       <p className={"status " + job.status}>{job.status}</p>
       {job.filename ? <p className="muted">{job.filename}</p> : null}
+      {job.status === "draft" && !job.filename ? (
+        <label>
+          Brochure
+          <input type="file" accept=".pdf,.txt,application/pdf,text/plain" onChange={attach} />
+        </label>
+      ) : null}
       {job.error ? <p className="error">{job.error}</p> : null}
       <ol>
         {job.checklist.map((step) => (
