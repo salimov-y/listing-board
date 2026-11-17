@@ -282,10 +282,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
 		return
 	}
-	job.Status = "running"
-	job.RunID = board.NewID()
-	job.UpdatedAt = time.Now().UTC()
-	err := s.store.UpdateJob(r.Context(), job)
+	started, err := s.store.StartJob(r.Context(), job.ID, board.NewID())
 	if errors.Is(err, board.ErrDuplicate) {
 		writeErr(w, http.StatusConflict, "Another sheet is already running")
 		return
@@ -294,7 +291,7 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, started)
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {

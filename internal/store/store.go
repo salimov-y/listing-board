@@ -163,9 +163,6 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 		SET status = $1, error = $2, run_id = $3, filename = $4, checklist = $5, updated_at = $6
 		WHERE id = $7
 	`, job.Status, job.Error, job.RunID, job.Filename, string(raw), job.UpdatedAt.UTC(), job.ID)
-	if isUnique(err) {
-		return board.ErrDuplicate
-	}
 	if err != nil {
 		return err
 	}
@@ -179,8 +176,26 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 	return nil
 }
 
+// StartJob moves a draft to running with runID. A sheet that already left draft comes back unchanged.
+func (s *Store) StartJob(ctx context.Context, id, runID string) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs SET status = 'running', run_id = $1, updated_at = $2
+		WHERE id = $3 AND status = 'draft'
+		RETURNING `+jobColumns, runID, time.Now().UTC(), id)
+	job, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.Job(ctx, id)
+	}
+	if isUnique(err) {
+		return board.Job{}, board.ErrDuplicate
+	}
+	return job, err
+}
+
+const jobColumns = `id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at`
+
 const jobSelect = `
-	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
+	SELECT ` + jobColumns + `
 	FROM jobs`
 
 type scanner interface {

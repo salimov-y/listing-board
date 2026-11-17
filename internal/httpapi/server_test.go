@@ -52,6 +52,34 @@ func TestStartLeavesTheStepsToTheWorker(t *testing.T) {
 	}
 }
 
+func TestParallelStartsGetTheSameRunID(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	responses := make([]*httptest.ResponseRecorder, 50)
+	var wg sync.WaitGroup
+	for i := range responses {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			responses[i] = call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+		}()
+	}
+	wg.Wait()
+
+	want := getSheet(t, srv, cookie, job.ID).RunID
+	for _, res := range responses {
+		if res.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", res.Code, res.Body.String())
+		}
+		if got := decodeJob(t, res); got.RunID != want {
+			t.Fatalf("a start returned runId %q, the sheet kept %q", got.RunID, want)
+		}
+	}
+}
+
 func TestStartNeedsABrochure(t *testing.T) {
 	srv, _ := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
@@ -498,13 +526,30 @@ func (m *mem) UpdateJob(_ context.Context, job board.Job) error {
 	if _, ok := m.jobs[job.ID]; !ok {
 		return board.ErrNotFound
 	}
-	for _, other := range m.jobs {
-		if job.Status == "running" && other.Status == "running" && other.UserID == job.UserID && other.ID != job.ID {
-			return board.ErrDuplicate
-		}
-	}
 	m.jobs[job.ID] = cloneJob(job)
 	return nil
+}
+
+func (m *mem) StartJob(_ context.Context, id, runID string) (board.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok {
+		return board.Job{}, board.ErrNotFound
+	}
+	if job.Status != "draft" {
+		return cloneJob(job), nil
+	}
+	for _, other := range m.jobs {
+		if other.Status == "running" && other.UserID == job.UserID {
+			return board.Job{}, board.ErrDuplicate
+		}
+	}
+	job.Status = "running"
+	job.RunID = runID
+	job.UpdatedAt = time.Now().UTC()
+	m.jobs[id] = job
+	return cloneJob(job), nil
 }
 
 func cloneJob(job board.Job) board.Job {

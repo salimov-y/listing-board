@@ -78,4 +78,5 @@ type Store interface {
 	CreateJob(ctx context.Context, job Job) error
 	Job(ctx context.Context, id string) (Job, error)
 	UpdateJob(ctx context.Context, job Job) error
+	StartJob(ctx context.Context, id, runID string) (Job, error)
 }
